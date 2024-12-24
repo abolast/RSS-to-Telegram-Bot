@@ -1,23 +1,34 @@
-FROM python:3.11-bullseye AS dep-builder-common
+#  RSS to Telegram Bot
+#  Copyright (C) 2024  Rongrong <i@rong.moe>
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU Affero General Public License as
+#  published by the Free Software Foundation, either version 3 of the
+#  License, or (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU Affero General Public License for more details.
+#
+#  You should have received a copy of the GNU Affero General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+FROM python:3.12-bookworm AS dep-builder-common
 
 ENV PATH="/opt/venv/bin:$PATH"
 
 RUN \
     set -ex && \
     python -m venv --copies /opt/venv && \
-    pip install --no-cache-dir --upgrade \
+    python -m pip install --no-cache-dir --upgrade \
         pip setuptools wheel
 
 COPY requirements.txt .
 
-# temporary workaround for aarch64
-ARG TARGETPLATFORM
 RUN \
     set -ex && \
     export MAKEFLAGS="-j$((`nproc`+1))" && \
-    if [ "$TARGETPLATFORM" != "linux/amd64" ]; then \
-      CFLAGS='-O3 -g1 -pipe -fPIC -flto' LDFLAGS='-flto' STATIC_DEPS='true' pip install lxml ; \
-    fi && \
     pip install --no-cache-dir \
         -r requirements.txt \
     && \
@@ -25,34 +36,28 @@ RUN \
 
 #-----------------------------------------------------------------------------------------------------------------------
 
-FROM python:3.11-bullseye AS dep-builder
-
-RUN \
-    set -ex && \
-    apt-get update && \
-    apt-get install -yq --no-install-recommends \
-        cmake \
-    && \
-    rm -rf /var/lib/apt/lists/* && \
-    git clone --depth=1 https://github.com/microsoft/mimalloc.git && \
-    mkdir -p /mimalloc/build/lib && \
-    cd /mimalloc/build && \
-    cmake /mimalloc && \
-    make mimalloc -j$((`nproc`+1)) && \
-    ln libmimalloc.so* lib/
+FROM python:3.12-bookworm AS dep-builder
 
 ENV PATH="/opt/venv/bin:$PATH"
+ARG EXP_REGEX='^([^~=<>]+)[^#]*#\s*(\1@.+)$'
+
+COPY requirements.txt .
+RUN \
+    set -ex && \
+    pip wheel --no-cache-dir --no-deps \
+        $(sed -nE "s/$EXP_REGEX/\2/p" requirements.txt)
 
 COPY --from=dep-builder-common /opt/venv /opt/venv
-COPY requirements.txt .
 
 ARG EXP_DEPS=0
 RUN \
     set -ex && \
     if [ "$EXP_DEPS" = 1 ]; then \
-        REGEX='^([^~=<>]+)[^#]*#\s*(\1@.+)$' ; \
-        pip uninstall -y $(sed -nE "s/$REGEX/\1/p" requirements.txt) && \
-        sed -Ei "s/$REGEX/\2/g" requirements.txt && \
+        AFFECTED_PKGS=$(sed -nE "s/$EXP_REGEX/\1/p" requirements.txt); \
+        pip uninstall -y $AFFECTED_PKGS && \
+        for pkg in $AFFECTED_PKGS; do \
+            sed -Ei "s#$pkg.*#$(find . -iname "${pkg}-*.whl")#" requirements.txt; \
+        done; \
         pip install --no-cache-dir \
             -r requirements.txt \
         ; \
@@ -60,7 +65,30 @@ RUN \
 
 #-----------------------------------------------------------------------------------------------------------------------
 
-FROM python:3.11-bullseye as app-builder
+FROM buildpack-deps:bookworm AS mimalloc-builder
+
+WORKDIR /mimalloc
+
+RUN \
+    set -ex && \
+    apt-get update && \
+    apt-get install -yq --no-install-recommends \
+        cmake \
+    && \
+    curl -sL https://github.com/microsoft/mimalloc/archive/refs/tags/v2.0.9.tar.gz | tar -zxf - --strip-components=1 && \
+    mkdir -p build/lib && \
+    cd build && \
+    cmake .. && \
+    make mimalloc -j$((`nproc`+1)) && \
+    ln libmimalloc.so* lib/ && \
+    apt-get purge -yq --auto-remove \
+        cmake \
+    && \
+    rm -rf /var/lib/apt/lists/*
+
+#-----------------------------------------------------------------------------------------------------------------------
+
+FROM python:3.12-bookworm AS app-builder
 
 WORKDIR /app
 
@@ -90,7 +118,7 @@ RUN \
 
 #-----------------------------------------------------------------------------------------------------------------------
 
-FROM python:3.11-slim-bullseye as app
+FROM python:3.12-slim-bookworm AS app
 
 WORKDIR /app
 
@@ -113,7 +141,7 @@ ENV \
     # https://github.com/home-assistant/core/pull/70899
     # https://github.com/jemalloc/jemalloc/blob/5.2.1/TUNING.md
 
-COPY --from=dep-builder /mimalloc/build/lib /usr/local/lib
+COPY --from=mimalloc-builder /mimalloc/build/lib /usr/local/lib
 COPY --from=dep-builder /opt/venv /opt/venv
 COPY --from=app-builder /app-minimal /app
 
